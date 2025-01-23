@@ -1,0 +1,541 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lambda Layer Deployment Template for Python - Automates the creation, deployment, and testing of Python package Lambda Layers, ensuring compatibility with specified runtime and architecture."
+
+Metadata:
+  Version: "2025-01-22.final"
+  Author: Taylan Unal <taylauna@amazon.com>
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Lambda Layer Configuration
+        Parameters:
+          - PackageName
+          - Runtime
+          - Architecture
+
+Parameters:
+  PackageName:
+    Type: String
+    Description: "Name of the Python package to create a Lambda Layer. Choose from the available options."
+    Default: "boto3"
+    AllowedPattern: "^[a-zA-Z0-9-_]+$"
+    ConstraintDescription: "Package name can only contain letters, numbers, hyphens, and underscores"
+    AllowedValues: # ["boto3", "requests", "urllib3", "aws-lambda-powertools", "aws-xray-sdk"]
+      - boto3
+      - requests
+      - urllib3
+      - aws-lambda-powertools
+      - aws-xray-sdk
+
+  Runtime:
+    Type: String
+    Description: "Python runtime version for the Lambda Layer. Select from the available Python versions (python3.10+)."
+    Default: "python3.13"
+    AllowedValues: # [python3.10, python3.11, python3.12, python3.13]
+      - "python3.10"
+      - "python3.11"
+      - "python3.12"
+      - "python3.13"
+
+  Architecture:
+    Type: String
+    Description: "CPU architecture for the Lambda Layer. Choose between ARM64 and x86_64."
+    Default: "arm64"
+    AllowedValues: # ["arm64", "x86_64"]
+      - "arm64"
+      - "x86_64"
+
+Outputs:
+  # Create Lambda Layer Outputs: !GetAtt [S3Location, S3Bucket, S3Key, PackageName, PackageVersion, PackageImportName, CompatibleRuntimes, CompatibleArchitectures]
+  LambdaLayerS3Location:
+    Description: "Amazon S3 Location of the Lambda Layer Package"
+    Value: !GetAtt LayerCreatorCustomResource.S3Location
+  LambdaLayerPackageName:
+    Description: "Name of the Lambda Layer Package"
+    Value: !GetAtt LayerCreatorCustomResource.PackageName
+  LambdaLayerPackageVersion:
+    Description: "Version of the Lambda Layer Package"
+    Value: !GetAtt LayerCreatorCustomResource.PackageVersion  
+
+  # AWS Lambda Layer Version Outputs
+  LambdaLayerVersionArn:
+    Description: "ARN of the Lambda Layer Version"
+    Value: !GetAtt LambdaLayer.LayerVersionArn
+  LambdaLayerName:
+    Description: "Name of the Lambda Layer"
+    Value: !Select [6, !Split [':', !GetAtt LambdaLayer.LayerVersionArn]] # Ex. arn:aws:lambda:us-east-2:123456789012:layer:my-layer:1 -> my-layer
+  
+  # Test Lambda Layer Outputs: !GetAtt [TestStatus, TestMessage]
+  TestOverallStatus:
+    Description: "Overall test status of the Python Package in the Lambda Layer (SUCCESS/FAILED)"
+    Value: !GetAtt LayerTestCustomResource.Status
+  TestMessage:
+    Description: "Test execution message or error details for the Python Package in the Lambda Layer"
+    Value: !GetAtt LayerTestCustomResource.Message
+
+Resources:
+  # Amazon S3 Bucket - Layer Package Storage
+  # Docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-s3-bucket.html
+  # Outputs: !Ref -> BucketName, !GetAtt BucketArn
+  LambdaLayerBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: "Delete"
+    UpdateReplacePolicy: "Retain"
+    Properties:
+      BucketName: !Sub 
+        - "s3-lambda-layers-${AWS::Region}-${UUID}"
+        - UUID: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      ObjectLockEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: 
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred # ObjectWriter | BucketOwnerPreferred | BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # CloudFormation Custom Resource - Layer Package Creator
+  # Docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cfn-customresource.html
+  # Outputs: !GetAtt S3Location, S3Bucket, S3Key, PackageName, PackageVersion, PackageImportName, CompatibleRuntimes, CompatibleArchitectures
+  LayerCreatorCustomResource:
+    Type: Custom::LayerCreator
+    Properties:
+      ServiceToken: !GetAtt LayerCreatorFunction.Arn
+      BucketName: !Ref LambdaLayerBucket
+      PackageName: !Ref PackageName
+      Runtime: !Ref Runtime
+      Architecture: !Ref Architecture
+
+  # AWS Lambda Function - Layer Creation Handler
+  # Docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-function.html
+  # Outputs: !Ref -> FunctionName, !GetAtt Arn
+  LayerCreatorFunction:
+    Type: AWS::Lambda::Function
+    UpdateReplacePolicy: "Delete"
+    DeletionPolicy: "Delete"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LayerCreatorRole.Arn
+      Code:
+        ZipFile: |
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+          # Description: This script will create an AWS Lambda Layer with the specified configurations, and upload it to Amazon S3.
+          # Version: 2025-01-21
+          import os
+          import sys
+          import subprocess
+          import shutil
+          import json
+          import logging
+          import urllib3
+          import boto3
+          import cfnresponse
+
+          # Configure Logging and HTTP Client
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          http = urllib3.PoolManager()
+
+          # Initialize AWS service clients
+          s3_client = boto3.client('s3')
+          lambda_client = boto3.client('lambda')
+
+          # Define supported Python packages by this utility. Note that other packages have not been tested to work with this utility.
+          SUPPORTED_PACKAGES = ['boto3', 'requests', 'urllib3', 'aws-lambda-powertools', 'aws-xray-sdk']
+
+          def get_latest_package_version(package_name):
+              """Retrieve the latest version of a Python package from PyPI."""
+              try:
+                  url = f'https://pypi.org/pypi/{package_name}/json'
+                  response = http.request('GET', url)
+                  if response.status != 200: 
+                      raise ValueError("PyPI request failed with status %d" % response.status)
+                  
+                  data = json.loads(response.data)
+                  version = data.get("info").get('version')
+                  if not version:
+                      raise ValueError("Version information not found in PyPI response")
+                  return version
+              except Exception as e:
+                  error_message = "Failed to get latest version for %s: %s" % (package_name, str(e))
+                  raise Exception(error_message)
+
+          def create_layer_package(package_name, package_version, runtime_version):
+              """
+              Create a Lambda Layer package by installing the specified Python package
+              and organizing it in the required directory structure.
+
+              Args:
+                  package_name (str): Name of the Python package to install
+                  package_version (str): Specific version of the package to install
+                  runtime_version (str): Python runtime version (e.g., 'python3.12')
+
+              Returns:
+                  str: File path to the created ZIP file
+
+              Notes:
+                  - Creates directory structure: /python/lib/python3.x/site-packages/
+                  - Uses pip to install the package with specific version
+                  - Packages everything into a ZIP file suitable for Lambda Layers
+              """
+              # Validate input parameters
+              if not all([package_name, package_version, runtime_version]):
+                  raise ValueError("Missing required parameters for package installation.")
+
+              # Define directory structure
+              temp_root = "/tmp"
+              site_packages_dir = os.path.join(temp_root, "site-packages")
+              python_dir = os.path.join(temp_root, "python")
+              temp_dirs = [site_packages_dir, python_dir]
+
+              # Define Lambda Layer ZIP Path
+              # Naming Convention: {package_name}-{runtime_version}-{architecture} ex. boto3-python313-arm64
+              zip_file = os.path.join(temp_root, f"{package_name}-{runtime_version}-{package_version}.zip")
+
+              try:
+                  # Cleanup existing directories and files
+                  for dir_path in temp_dirs:
+                      if os.path.exists(dir_path):
+                          shutil.rmtree(dir_path)
+                  if os.path.exists(zip_file):
+                      os.remove(zip_file)
+                  
+                  # Install package using pip (quiet mode)
+                  subprocess.check_call([
+                      sys.executable, "-m", "pip", "install", "-q",
+                      f"{package_name}=={package_version}",
+                      "--target", site_packages_dir,
+                      "--no-cache-dir",
+                      "--disable-pip-version-check"
+                  ])
+
+                  # Create and populate Lambda Layer directory structure
+                  python_lib_path = os.path.join(python_dir, "lib", runtime_version)
+                  os.makedirs(python_lib_path, exist_ok=True)
+                  shutil.move(site_packages_dir, os.path.join(python_lib_path, "site-packages"))
+
+                  # Create ZIP file
+                  zip_base = os.path.splitext(zip_file)[0]
+                  shutil.make_archive(zip_base, 'zip', temp_root, 'python')
+                  if not os.path.exists(zip_file):
+                      raise FileNotFoundError(f"Failed to create ZIP file: {zip_file}")
+                  
+                  return zip_file
+              except Exception as e:
+                  raise Exception(f"Layer package creation failed: {str(e)}")
+              finally:
+                  # Cleanup temporary directories
+                  for dir_path in temp_dirs:
+                      if os.path.exists(dir_path):
+                          shutil.rmtree(dir_path)
+
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for creating Lambda Layer packages and storing in S3.
+
+              Workflow:
+              1. Get latest version of specified package from PyPI
+              2. Create Lambda Layer package with correct structure
+              3. Upload package to S3
+
+              Args:
+                  event (dict): Lambda event data
+                  context (LambdaContext): Lambda context object
+
+              Returns:
+                  dict: Response data including S3 location and package metadata
+              """
+              logger.info("Event Received: %s", json.dumps(event, default=str))
+              logger.debug("Installed Boto3 Version: %s", boto3.__version__)
+
+              # Define ResponseData
+              response_data = {
+                  "S3Location": "", "S3Bucket": "", "S3Key": "",
+                  "PackageName": "", "PackageVersion": "", "PackageImportName": "",
+                  "CompatibleRuntimes": "", "CompatibleArchitectures": ""
+              }
+
+              # Handle CloudFormation Delete Event
+              if event.get('RequestType') == 'Delete':
+                  cfnresponse.send(event, context, "SUCCESS", response_data)
+                  return response_data
+
+              try:
+                  # Get Configuration from Resource Properties. Ex: "ResourceProperties": {"ServiceToken": "", "BucketName": "", "PackageName": "", "Runtime": "", "Architecture": ""}
+                  properties = event.get('ResourceProperties', {})
+                  bucket_name = properties.get('BucketName')
+                  package_name = properties.get('PackageName')
+                  runtime = properties.get('Runtime')
+                  architecture = properties.get('Architecture')
+
+                  # Validate that Required Properties are set
+                  required_props = {'BucketName': bucket_name, 'PackageName': package_name, 'Runtime': runtime, 'Architecture': architecture}
+                  missing_props = [k for k, v in required_props.items() if not v]
+                  if missing_props:
+                      raise ValueError("Missing required properties: %s" % ', '.join(missing_props))
+
+                  # Validate that the requested package is a Supported Package
+                  if package_name not in SUPPORTED_PACKAGES:
+                      raise ValueError(
+                          f"Package '{package_name}' is not supported."
+                          f"Supported packages: {', '.join(sorted(SUPPORTED_PACKAGES))}\n"
+                          "Note: Only single-word packages or hyphenated packages that follow standard Python import naming are currently supported."
+                      )
+                  
+                  # Step 1: Get Package Information: 1) Package Version from PyPI, 2) Package Import Name.
+                  package_version = get_latest_package_version(package_name)
+                  package_import_name = package_name.replace('-', '_') # Get package "import_name" from "package_name" according to PEP8 convention. (Converting hyphens to underscores
+                  logger.info("Package: %s - Version: %s - Import Name: %s", package_name, package_version, package_import_name)
+                  
+                  # Step 2: Create the Layer package
+                  zip_file = create_layer_package(package_name, package_version, runtime)
+                  logger.info("Layer package created: %s", zip_file)
+                  
+                  # Step 3: Upload Lambda Layer to Amazon S3 Bucket
+                  layer_name = f"{runtime.replace('.', '')}-{architecture}-{package_name}" # ex. python313-arm64-boto3
+                  s3_key = f'{layer_name}.zip'
+                  logger.info("Uploading package to S3: s3://%s/%s", bucket_name, s3_key)
+
+                  try:
+                      s3_client.upload_file(zip_file, bucket_name, s3_key)
+                      logger.info("Package uploaded to s3://%s/%s", bucket_name, s3_key)
+                  finally:
+                      # Cleanup zip file after upload
+                      if os.path.exists(zip_file):
+                          os.remove(zip_file)
+                          logger.info("Cleaned up local zip file: %s", zip_file)
+
+                  # Step 4: Update response_data with S3 and package information
+                  response_data.update({
+                      "S3Location": f"s3://{bucket_name}/{s3_key}", "S3Bucket": bucket_name, "S3Key": s3_key,
+                      "PackageName": package_name, "PackageVersion": package_version, "PackageImportName": package_import_name,
+                      "CompatibleRuntimes": str([runtime]), "CompatibleArchitectures": str([architecture])
+                  })
+                  
+                  # Send success response to CloudFormation
+                  logger.info("Package successfully uploaded to Amazon S3: %s", response_data["S3Location"])
+                  cfnresponse.send(event, context, "SUCCESS", response_data)
+              except Exception as e:
+                  error_msg = "Lambda Layer creation failed: %s" % str(e)
+                  logger.error(error_msg, exc_info=True)
+                  cfnresponse.send(event, context, "FAILED", response_data, reason=error_msg)
+
+              # Log and Return Response Data
+              logger.info("Response Data: %s", json.dumps(response_data, default=str))
+              return response_data
+      Runtime: !Ref Runtime
+      Architectures: [!Ref Architecture]
+      ReservedConcurrentExecutions: 1
+      Timeout: 300
+      MemorySize: 512
+
+  # AWS IAM Role - Layer Creator Permissions
+  # Docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-role.html
+  # Outputs: !Ref -> RoleName, !GetAtt Arn, RoleId
+  LayerCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # Policies:
+      #   - PolicyName: LayerCreatorPermissions
+      #     PolicyDocument:
+      #       Version: '2012-10-17'
+      #       Statement:
+      #         - Effect: Allow
+      #           Action:
+      #             - s3:PutObject
+      #             - s3:GetObject
+      #           Resource: !Sub "arn:${AWS::Partition}:s3:::${LambdaLayerBucket}/*"
+      #         - Effect: Allow
+      #           Action:
+      #             - lambda:PublishLayerVersion
+      #             - lambda:GetLayerVersion
+      #           Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:layer:*"
+  LayerCreatorRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref LayerCreatorRole
+      PolicyName: LayerCreatorRolePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${LambdaLayerBucket}/*"
+          - Effect: Allow
+            Action:
+              - lambda:PublishLayerVersion
+              - lambda:GetLayerVersion
+            Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:layer:*"
+
+  # AWS Lambda Layer Resource
+  # Docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-layerversion.html
+  # Example JSON: https://pypi.org/pypi/boto3/json
+  # Outputs: !Ref -> LayerVersionArn. !GetAtt LayerVersionArn. Ex. arn:aws:lambda:us-east-2:123456789012:layer:my-layer:1 
+  LambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    UpdateReplacePolicy: "Delete"
+    DeletionPolicy: "Delete"
+    Properties:
+      LayerName: !Sub # ex. boto3-python313-arm64
+        - "${PackageName}-${RuntimeMajor}${RuntimeMinor}-${Architecture}"
+        - RuntimeMajor: !Select [0, !Split ['.', !Ref Runtime]]
+          RuntimeMinor: !Select [1, !Split ['.', !Ref Runtime]]
+      Description: !Sub "Lambda Layer - Package: ${PackageName}, Runtime: ${Runtime}, Architecture: ${Architecture}"
+      CompatibleArchitectures:
+        - !Ref Architecture
+      CompatibleRuntimes:
+        - !Ref Runtime
+      Content:
+        # Example Output: s3-lambda-layers-us-east-1-0a123456789/boto3_1_36_2.zip
+        S3Bucket: !GetAtt LayerCreatorCustomResource.S3Bucket
+        S3Key: !GetAtt LayerCreatorCustomResource.S3Key
+
+  # CloudFormation Custom Resource - Layer Test Controller
+  # Docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cfn-customresource.html
+  # Outputs: !GetAtt Status, Message, TestPackage, TestPackageVersion, TestRuntime, TestArchitecture
+  LayerTestCustomResource:
+    Type: Custom::LayerTester
+    Properties:
+      ServiceToken: !GetAtt LayerTestFunction.Arn
+      PackageName: !Ref PackageName
+      PackageImportName: !GetAtt LayerCreatorCustomResource.PackageImportName
+      PackageVersion: !GetAtt LayerCreatorCustomResource.PackageVersion
+      Runtime: !Ref Runtime
+      Architecture: !Ref Architecture
+
+  # AWS Lambda Function - Layer Test Handler
+  # Docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-function.html
+  # Outputs: !Ref -> FunctionName, !GetAtt Arn
+  LayerTestFunction:
+    Type: AWS::Lambda::Function
+    UpdateReplacePolicy: "Delete"
+    DeletionPolicy: "Delete"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LayerTestRole.Arn
+      Code:
+        ZipFile: |
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+          # Description: Lambda Layer Validation Handler tests and validates package deployments by verifying package availability and version.
+          # Version: 2025-01-22
+          import json
+          import logging
+          import importlib
+          import platform
+          import sys
+          import cfnresponse
+
+          # Configure Logging Client
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """ Validate Lambda Layer deployment and return comprehensive status information about package, version, runtime, and architecture compatibility """
+              logger.info("Event Received: %s", json.dumps(event, default=str))
+              
+              # Define consistent Response Data expected by AWS CloudFormation
+              response_data = {"Status": "", "Message": "", "TestPackage": "", "TestPackageVersion": "", "TestRuntime": "", "TestArchitecture": ""}
+              
+              # Handle CloudFormation stack deletion
+              if event.get('RequestType') == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  return response_data
+                  
+              try:
+                  # Get configuration from ResourceProperties (Expected: {"ServiceToken": "", "PackageName": "", "PackageVersion": "", "TargetRuntime": "", "TargetArchitecture": ""})
+                  properties = event.get('ResourceProperties', {})
+                  package_name = properties.get('PackageName', 'N/A')
+                  package_import_name = properties.get('PackageImportName', 'N/A')
+                  target_version = properties.get('PackageVersion', 'N/A')
+                  target_runtime = properties.get('Runtime', 'N/A')
+                  target_architecture = properties.get('Architecture', 'N/A')
+                      
+                  # Get Current Configuration 
+                  current_runtime = f"python{sys.version_info.major}.{sys.version_info.minor}"
+                  current_arch = platform.machine() # "x86_64" | "aarch64"
+                  current_arch = "arm64" if current_arch == "aarch64" else current_arch # If platform.machine() returns "aarch64", then current_arch = "arm64"
+
+                  # Import the package from Lambda Layer, validating the installation.
+                  try:
+                      # Note: Package Import Name is the same as Package Name if the package is PEP 8 compliant
+                      package = importlib.import_module(package_import_name)
+                      installed_version = getattr(package, '__version__', 'Version Not Found')
+                      package_status = "INSTALLED"
+                  except ImportError:
+                      installed_version = "NOT INSTALLED"
+                      package_status = "NOT INSTALLED"
+                  
+                  # Construct Overall Status from individual test cases.
+                  overall_status = "SUCCESS" if all([
+                      package_status == "INSTALLED",
+                      installed_version == target_version, 
+                      current_runtime == target_runtime,
+                      current_arch == target_architecture
+                  ]) else "FAILED"
+
+                  # Construct TestMessage with individual test data
+                  test_message = (
+                      f"Installation: Target: {package_name}, Current: {package_status}. "
+                      f"Version: Target: {target_version}, Current: {installed_version}. "
+                      f"Runtime: Target: {target_runtime}, Current: {current_runtime}. "
+                      f"Architecture: Target: {target_architecture}, Current: {current_arch}. "
+                  )
+
+                  # Update Response Data and send Response
+                  response_data.update({"Status": overall_status, "Message": test_message})
+                  cfnresponse.send(event, context, overall_status, response_data)
+              except Exception as e:
+                  error_message = str(e)
+                  logger.error("Error during validation: %s", error_message)
+                  response_data.update({"Status": "FAILED", "Message": error_message})
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data, reason=error_message)
+              
+              # Log and return Response Data
+              logger.info("Response Data: %s", json.dumps(response_data, default=str))
+              return response_data
+      Runtime: !Ref Runtime
+      Architectures: [!Ref Architecture]
+      ReservedConcurrentExecutions: 1
+      Timeout: 30
+      MemorySize: 128
+      Layers:
+        - !GetAtt LambdaLayer.LayerVersionArn
+
+  # AWS IAM Role - Layer Tester Permissions
+  # Docs: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-role.html
+  # Outputs: !Ref -> RoleName, !GetAtt Arn, RoleId
+  LayerTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
