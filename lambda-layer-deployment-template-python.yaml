@@ -82,7 +82,8 @@ Resources:
   # Outputs: !Ref -> BucketName, !GetAtt BucketArn
   LambdaLayerBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: "Delete"
+    # NOTE: By setting DeletionPolicy to Retain, the stack can be deleted without deleting the contents of the S3 bucket.
+    DeletionPolicy: "Retain" 
     UpdateReplacePolicy: "Retain"
     Properties:
       BucketName: !Sub 
