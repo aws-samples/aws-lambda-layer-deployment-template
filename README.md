@@ -101,6 +101,7 @@ Your Lambda Layer is now ready for use with your AWS Lambda functions. For detai
 - [AWS Lambda Developer Guide - Managing Lambda dependencies with layers](https://docs.aws.amazon.com/lambda/latest/dg/configuration-layers.html)
 - [AWS Lambda Developer Guide - Selecting and configuring an instruction set architecture for your Lambda function](https://docs.aws.amazon.com/lambda/latest/dg/foundation-arch.html)
 - [AWS Lambda Developer Guide - Lambda Runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)
+- [AWS Lambda Developer Guide - Using AWS CloudFormation with layers](https://docs.aws.amazon.com/lambda/latest/dg/layers-cfn.html)
 - [PEP 423 – Naming conventions and recipes related to packaging](https://www.python.org/dev/peps/pep-0423/)
 
 ## Troubleshooting
