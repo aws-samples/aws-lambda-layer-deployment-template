@@ -5,8 +5,8 @@ Description: >
   Lambda Layer Deployment Template for Python - Automates the creation, deployment, and testing of Python package Lambda Layers, ensuring compatibility with specified runtime and architecture."
 
 Metadata:
-  Version: "2025-01-22.final"
-  Author: Taylan Unal <taylauna@amazon.com>
+  Version: "2025-02-14"
+  Author: "Taylan Unal"
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
@@ -356,21 +356,6 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      # Policies:
-      #   - PolicyName: LayerCreatorPermissions
-      #     PolicyDocument:
-      #       Version: '2012-10-17'
-      #       Statement:
-      #         - Effect: Allow
-      #           Action:
-      #             - s3:PutObject
-      #             - s3:GetObject
-      #           Resource: !Sub "arn:${AWS::Partition}:s3:::${LambdaLayerBucket}/*"
-      #         - Effect: Allow
-      #           Action:
-      #             - lambda:PublishLayerVersion
-      #             - lambda:GetLayerVersion
-      #           Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:layer:*"
   LayerCreatorRolePolicy:
     Type: AWS::IAM::RolePolicy
     Properties:
