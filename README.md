@@ -1,7 +1,6 @@
 # AWS Lambda Layer Deployment Template for Python (aws-lambda-layer-deployment-template)
-![GitHub release (latest by date)](https://img.shields.io/github/v/release/aws-samples/lambda-layer-deployment-template)
-![GitHub](https://img.shields.io/github/license/aws-samples/lambda-layer-deployment-template)
-![GitHub last commit](https://img.shields.io/github/last-commit/aws-samples/lambda-layer-deployment-template)
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/aws-samples/lambda-layer-deployment-template?style=flat-square)
+[![License](https://img.shields.io/github/license/aws-samples/lambda-layer-deployment-template?style=flat-square)](./LICENSE)
 
 ## Overview
 This project will automate the deployment of AWS Lambda Layers for Python-based deployments using AWS CloudFormation. Traditional Lambda Layer management often leads to outdated dependencies, as layers are typically created manually and updated infrequently. This project is ideal for AWS developers and DevOps engineers who want to streamline their Lambda function management and ensure consistent Python package versions across their serverless applications.
